@@ -29,6 +29,7 @@ public:
     using size_type = size_t;
     SbAllocator(void);
     SbAllocator(const SbAllocator &other);
+    SbAllocator(SbAllocator &&other);
     pointer allocate(size_type n);
     void deallocate(pointer p);
     pointer mmap(T *p, size_type n);
@@ -69,6 +70,17 @@ SbAllocator<T>::SbAllocator(const SbAllocator &other)
     }
 
     m_total_limit = other.m_total_limit;
+}
+
+template <typename T>
+SbAllocator<T>::SbAllocator(SbAllocator &&other)
+    : std::allocator<T>(other)
+    , m_seglist(other.m_seglist)
+    , m_cache_seg(other.m_cache_seg)
+{
+    other.m_seglist.clear();
+    other.m_total_limit = base_vaddr;
+    other.m_cache_seg = nullptr;
 }
 
 template <typename T>

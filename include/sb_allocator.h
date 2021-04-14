@@ -17,6 +17,7 @@ struct Segment {
     uintptr_t m_base;
     uintptr_t m_vbase;
     uintptr_t m_limit;
+    bool m_mapped;
 }; // End of struct
 
 template <typename T>
@@ -30,6 +31,8 @@ public:
     SbAllocator(const SbAllocator &other);
     pointer allocate(size_type n);
     void deallocate(pointer p);
+    pointer mmap(T *p, size_type n);
+    void unmap(pointer p);
     uintptr_t translateAddr(uintptr_t vaddr);
     iterator begin(void);
     iterator end(void);
@@ -71,9 +74,11 @@ SbAllocator<T>::SbAllocator(const SbAllocator &other)
 template <typename T>
 SbAllocator<T>::~SbAllocator(void)
 {
-    for (const auto &x : m_seglist) {
-        std::free(reinterpret_cast<void*>(x.m_base));
-    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto f = [] (const Segment &s)
+        { if (!s.m_mapped) { std::free(reinterpret_cast<void*>(s.m_base)); } };
+    std::for_each(m_seglist.begin(), m_seglist.end(), f);
 }
 
 template <typename T>
@@ -88,7 +93,9 @@ typename SbAllocator<T>::pointer SbAllocator<T>::allocate(size_type n)
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    m_seglist.push_back({ptr, m_total_limit, m_total_limit + size});
+    Segment segm = {ptr, m_total_limit, m_total_limit + size, false};
+
+    m_seglist.emplace_back(segm);
 
     Iterator<T, SbAllocator> temp(this, m_total_limit);
 
@@ -100,14 +107,14 @@ typename SbAllocator<T>::pointer SbAllocator<T>::allocate(size_type n)
 template <typename T>
 void SbAllocator<T>::deallocate(pointer p)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     auto f = [p = p] (const Segment &s) { return (s.m_vbase == p); };
     auto iter = std::find_if(m_seglist.begin(), m_seglist.end(), f);
     if (iter == m_seglist.end()) {
         throw std::runtime_error(
             "SbAllocator<T>::deallocate(pointer) failed, invalid pointer");
     }
-
-    std::lock_guard<std::mutex> lock(m_mutex);
 
     size_type size = iter->m_limit - iter->m_vbase;
 
@@ -120,6 +127,50 @@ void SbAllocator<T>::deallocate(pointer p)
     m_total_limit -= size;
 
     std::free(reinterpret_cast<void*>(temp->m_base));
+    m_seglist.erase(temp);
+}
+
+template <typename T>
+typename SbAllocator<T>::pointer SbAllocator<T>::mmap(T *p, size_type n)
+{
+    size_type size = n * sizeof(T);
+    uintptr_t ptr = reinterpret_cast<uintptr_t>(p);
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    Segment segm = {ptr, m_total_limit, m_total_limit + size, true};
+
+    m_seglist.emplace_back(segm);
+
+    Iterator<T, SbAllocator> temp(this, m_total_limit);
+
+    m_total_limit += size;
+
+    return temp;
+}
+
+template <typename T>
+void SbAllocator<T>::unmap(pointer p)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto f = [p = p] (const Segment &s) { return (s.m_vbase == p); };
+    auto iter = std::find_if(m_seglist.begin(), m_seglist.end(), f);
+    if (iter == m_seglist.end()) {
+        throw std::runtime_error(
+            "SbAllocator<T>::unmap(pointer) failed, invalid pointer");
+    }
+
+    size_type size = iter->m_limit - iter->m_vbase;
+
+    auto temp = iter;
+
+    for ( ; iter != m_seglist.end(); ++iter) {
+        iter->m_vbase -= size;
+        iter->m_limit -= size;
+    }
+    m_total_limit -= size;
+
     m_seglist.erase(temp);
 }
 
@@ -144,8 +195,7 @@ uintptr_t SbAllocator<T>::translateAddr(uintptr_t vaddr)
     auto iter = std::find_if(m_seglist.begin(), m_seglist.end(), f);
     if (iter == m_seglist.end()) {
         // unreachable
-        throw std::runtime_error(
-            "SbAllocator<T>::translateAddr(uintptr_t) failed");
+        throw std::runtime_error("SbAllocator<T>::translateAddr(uintptr_t) failed");
     }
 
     m_cache_seg = std::addressof(*iter);
